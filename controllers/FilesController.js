@@ -1,110 +1,229 @@
-import RedisClient from '../utils/redis'; // Redis client for managing cache
-import { v4 as uuidv4 } from 'uuid'; // UUID for generating unique IDs
-import DBClient from '../utils/db'; // Database client for MongoDB
-import { ObjectId } from 'mongodb'; // MongoDB's ObjectId for querying
-import fs from 'fs'; // File system module for managing files
-import mime from 'mime-types'; // Module for determining MIME type of files
-import Bull from 'bull'; // Queue system for job processing
+const dbClient = require('../utils/db');
+const redisClient = require('../utils/redis');
+const fs = require('fs/promises');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
+const mime = require('mime-types');
+const imageThumbnail = require('image-thumbnail');
+const { addJob } = require('../utils/queue'); // Import queue utility
 
-class FilesController {
-  // Handle file upload
-  static async postUpload(req, res) {
-    const fileQueue = new Bull('fileQueue'); // Job queue for file processing
+const storagePath = process.env.FOLDER_PATH || '/tmp/files_manager';
 
-    const token = req.header('X-Token') || null; // Get the token from the request header
-    if (!token) return res.status(401).send({ error: 'Unauthorized' });
+const postUpload = async (req, res) => {
+  try {
+    const { name, type, data, parentId = '0', isPublic = false } = req.body;
+    const userId = req.userId; // User ID from middleware (see AuthController)
 
-    // Check if the token is valid using Redis for caching
-    const redisToken = await RedisClient.get(`auth_${token}`);
-    if (!redisToken) return res.status(401).send({ error: 'Unauthorized' });
-
-    // Retrieve user information from the database using the token
-    const user = await DBClient.db
-      .collection('users')
-      .findOne({ _id: ObjectId(redisToken) });
-    if (!user) return res.status(401).send({ error: 'Unauthorized' });
-
-    const fileName = req.body.name; // Extract file name from request
-    if (!fileName) return res.status(400).send({ error: 'Missing name' });
-
-    const fileType = req.body.type; // Extract file type
-    if (!fileType || !['folder', 'file', 'image'].includes(fileType)) 
-      return res.status(400).send({ error: 'Missing type' });
-
-    const fileData = req.body.data; // Extract file data
-    if (!fileData && ['file', 'image'].includes(fileType)) 
-      return res.status(400).send({ error: 'Missing data' });
-
-    const fileIsPublic = req.body.isPublic || false; // Check if file is public
-    let idParent = req.body.parentId || 0; // Parent file ID (for nested files/folders)
-    idParent = idParent === '0' ? 0 : idParent;
-
-    // If there is a parent, verify it exists and is a folder
-    if (idParent !== 0) {
-      const parentFile = await DBClient.db
-        .collection('files')
-        .findOne({ _id: ObjectId(idParent) });
-      if (!parentFile) return res.status(400).send({ error: 'Parent not found' });
-      if (!['folder'].includes(parentFile.type)) return res.status(400).send({ error: 'Parent is not a folder' });
+    if (!name) {
+      return res.status(400).json({ error: 'Missing name' });
     }
 
-    // Prepare the file object for insertion into the database
-    const dbFile = {
-      userId: user._id,
-      name: fileName,
-      type: fileType,
-      isPublic: fileIsPublic,
-      parentId: idParent,
+    const allowedTypes = ['folder', 'file', 'image'];
+    if (!allowedTypes.includes(type)) {
+      return res.status(400).json({ error: 'Missing or invalid type' });
+    }
+
+    if (type !== 'folder' && !data) {
+      return res.status(400).json({ error: 'Missing data' });
+    }
+
+    if (parentId !== '0') {
+      const parentFile = await dbClient
+        .client.db()
+        .collection('files')
+        .findOne({ _id: new ObjectId(parentId) });
+
+      if (!parentFile) {
+        return res.status(400).json({ error: 'Parent not found' });
+      }
+
+      if (parentFile.type !== 'folder') {
+        return res.status(400).json({ error: 'Parent is not a folder' });
+      }
+    }
+
+    const newFile = {
+      userId,
+      name,
+      type,
+      isPublic,
+      parentId,
     };
 
-    // If file is a folder, simply insert into the database
-    if (['folder'].includes(fileType)) {
-      await DBClient.db.collection('files').insertOne(dbFile);
-      return res.status(201).send({
-        id: dbFile._id,
-        userId: dbFile.userId,
-        name: dbFile.name,
-        type: dbFile.type,
-        isPublic: dbFile.isPublic,
-        parentId: dbFile.parentId,
-      });
+    if (type !== 'folder') {
+      const uniqueFileName = uuidv4();
+      const filePath = path.join(storagePath, uniqueFileName);
+
+      // Decode Base64 data and write to file
+      const buffer = Buffer.from(data, 'base64');
+      await fs.writeFile(filePath, buffer);
+
+      newFile.localPath = filePath;
+
+      // Add job to queue for image thumbnail generation
+      if (type === 'image') {
+        addJob('fileQueue', { userId, fileId: newFile._id.toString() });
+      }
     }
 
-    // For other file types, handle file storage and queue processing
-    const pathDir = process.env.FOLDER_PATH || '/tmp/files_manager'; // Directory to store files
-    const uuidFile = uuidv4(); // Generate a unique identifier for the file
+    const result = await dbClient
+      .client.db()
+      .collection('files')
+      .insertOne(newFile);
 
-    const buff = Buffer.from(fileData, 'base64'); // Convert base64 file data to buffer
-    const pathFile = `${pathDir}/${uuidFile}`; // Define file path
-
-    // Ensure the directory exists and write the file
-    try {
-      await fs.promises.mkdir(pathDir, { recursive: true });
-      await fs.promises.writeFile(pathFile, buff);
-    } catch (error) {
-      return res.status(400).send({ error: error.message });
-    }
-
-    // Add file path to the database record
-    dbFile.localPath = pathFile;
-    await DBClient.db.collection('files').insertOne(dbFile);
-
-    // Add job to the queue for file processing (e.g., resizing, virus scanning)
-    fileQueue.add({
-      userId: dbFile.userId,
-      fileId: dbFile._id,
-    });
-
-    return res.status(201).send({
-      id: dbFile._id,
-      userId: dbFile.userId,
-      name: dbFile.name,
-      type: dbFile.type,
-      isPublic: dbFile.isPublic,
-      parentId: dbFile.parentId,
-    });
+    res.status(201).json({ id: result.insertedId.toString(), ...newFile });
+  } catch (error) {
+    console.error('postUpload Error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
   }
+};
 
-  // Other methods (getShow, getIndex, putPublish, putUnpublish, etc.) will also need similar fixes if needed.
-}
+const getShow = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.userId; // User ID from middleware (see AuthController)
 
+    const file = await dbClient
+      .client.db()
+      .collection('files')
+      .findOne({ _id: new ObjectId(id), $or: [{ userId }, { isPublic: true }] });
+
+    if (!file) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    res.status(200).json(file);
+  } catch (error) {
+    console.error('getShow Error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+const getIndex = async (req, res) => {
+  try {
+    const userId = req.userId; // User ID from middleware (see AuthController)
+    const { parentId = '0', page = 0 } = req.query;
+
+    const files = await dbClient
+      .client.db()
+      .collection('files')
+      .find({ $or: [{ userId }, { isPublic: true }], parentId: new ObjectId(parentId) })
+      .skip(page * 20) // Pagination: 20 items per page
+      .limit(20)
+      .toArray();
+
+    res.status(200).json(files);
+  } catch (error) {
+    console.error('getIndex Error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+const putPublish = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.userId; // User ID from middleware (see AuthController)
+
+    const file = await dbClient
+      .client.db()
+      .collection('files')
+      .findOne({ _id: new ObjectId(id), userId });
+
+    if (!file) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const result = await dbClient
+      .client.db()
+      .collection('files')
+      .updateOne({ _id: new ObjectId(id) }, { $set: { isPublic: true } });
+
+    if (result.modifiedCount === 0) {
+      return res.status(500).json({ error: 'Internal Server Error' });
+    }
+
+    res.status(200).json({ ...file, isPublic: true });
+  } catch (error) {
+    console.error('putPublish Error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+const putUnpublish = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const userId = req.userId; // User ID from middleware (see AuthController)
+
+    const file = await dbClient
+      .client.db()
+      .collection('files')
+      .findOne({ _id: new ObjectId(id), userId });
+
+    if (!file) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    const result = await dbClient
+      .client.db()
+      .collection('files')
+      .updateOne({ _id: new ObjectId(id) }, { $set: { isPublic: false } });
+
+    if (result.modifiedCount === 0) {
+      return res.status(500).json({ error: 'Internal Server Error' });
+    }
+
+    res.status(200).json({ ...file, isPublic: false });
+  } catch (error) {
+    console.error('putUnpublish Error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+const getFile = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { size } = req.query;
+    const userId = req.userId; // User ID from middleware (see AuthController)
+
+    const file = await dbClient
+      .client.db()
+      .collection('files')
+      .findOne({ _id: new ObjectId(id), $or: [{ userId }, { isPublic: true }] });
+
+    if (!file) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+
+    if (file.type === 'folder') {
+      return res.status(400).json({ error: "A folder doesn't have content" });
+    }
+
+    let filePath = file.localPath;
+
+    if (size && file.type === 'image') {
+      filePath += `_${size}`;
+    }
+
+    try {
+      const fileData = await fs.readFile(filePath);
+      const mimeType = mime.lookup(file.name);
+
+      res.setHeader('Content-Type', mimeType);
+      res.send(fileData);
+    } catch (error) {
+      return res.status(404).json({ error: 'Not found' });
+    }
+  } catch (error) {
+    console.error('getFile Error:', error);
+    res.status(500).json({ error: 'Internal Server Error' });
+  }
+};
+
+module.exports = {
+  postUpload,
+  getShow,
+  getIndex,
+  putPublish,
+  putUnpublish,
+  getFile,
+};

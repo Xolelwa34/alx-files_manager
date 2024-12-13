@@ -1,53 +1,44 @@
-// utils/redis.js
-
-import redis from 'redis';
+const redis = require('redis');
 
 class RedisClient {
-  constructor() {
-    this.client = redis.createClient({
-      host: process.env.REDIS_HOST || 'localhost',
-      port: process.env.REDIS_PORT || 6379,
-    });
+  constructor(host = 'localhost', port = 6379) {
+    this.client = redis.createClient({ host, port });
 
     this.client.on('error', (err) => {
-      console.error('Redis error:', err);
+      console.error('Redis Client Error:', err);
     });
   }
 
   isAlive() {
-    // Attempting to check connection by pinging Redis server
     return this.client.connected;
   }
 
   async get(key) {
-    return new Promise((resolve, reject) => {
-      this.client.get(key, (err, value) => {
-        if (err) reject(err);
-        resolve(value);
-      });
-    });
+    try {
+      const value = await this.client.get(key);
+      return value ? JSON.parse(value) : null; // Parse JSON for data retrieval
+    } catch (error) {
+      console.error('Redis Get Error:', error);
+      return null;
+    }
   }
 
   async set(key, value, duration) {
-    return new Promise((resolve, reject) => {
-      this.client.setex(key, duration, value, (err, reply) => {
-        if (err) reject(err);
-        resolve(reply);
-      });
-    });
+    try {
+      await this.client.set(key, JSON.stringify(value), 'EX', duration); // Set expiration
+    } catch (error) {
+      console.error('Redis Set Error:', error);
+    }
   }
 
   async del(key) {
-    return new Promise((resolve, reject) => {
-      this.client.del(key, (err, reply) => {
-        if (err) reject(err);
-        resolve(reply);
-      });
-    });
+    try {
+      await this.client.del(key);
+    } catch (error) {
+      console.error('Redis Del Error:', error);
+    }
   }
 }
 
 const redisClient = new RedisClient();
-
-export default redisClient;
-
+module.exports = redisClient;

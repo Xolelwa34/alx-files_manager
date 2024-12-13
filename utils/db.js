@@ -1,34 +1,49 @@
-import { MongoClient } from 'mongodb';
+const { MongoClient } = require('mongodb');
 
 class DBClient {
-  constructor () {
-    const host = process.env.DB_HOST || 'localhost';
-    const port = process.env.DB_PORT || 27017;
-    const database = process.env.DB_DATABASE || 'files_manager';
-
-    const uri = `mongodb://${host}:${port}/${database}`;
-
-    this.client = new MongoClient(uri, { useNewUrlParser: true, useUnifiedTopology: true });
-    this.client.connect();
-    this.db = this.client.db(database);
+  constructor(host = 'localhost', port = 27017, database = 'files_manager') {
+    this.uri = `mongodb://${host}:${port}/${database}`;
+    this.client = null;
   }
 
-  isAlive () {
-    return this.client.isConnected();
+  async connect() {
+    try {
+      this.client = await MongoClient.connect(this.uri, { useNewUrlParser: true });
+      console.log('Connected to MongoDB');
+    } catch (error) {
+      console.error('MongoDB Connection Error:', error);
+    }
   }
 
-  async nbUsers () {
-    const usersCollection = this.db.collection('users');
-    const count = await usersCollection.countDocuments();
-    return count;
+  isAlive() {
+    return this.client && this.client.isConnected();
   }
 
-  async nbFiles () {
-    const filesCollection = this.db.collection('files');
-    const count = await filesCollection.countDocuments();
-    return count;
+  async nbUsers() {
+    try {
+      const collection = this.client.db().collection('users');
+      const count = await collection.countDocuments();
+      return count;
+    } catch (error) {
+      console.error('MongoDB nbUsers Error:', error);
+      return 0;
+    }
+  }
+
+  async nbFiles() {
+    try {
+      const collection = this.client.db().collection('files');
+      const count = await collection.countDocuments();
+      return count;
+    } catch (error) {
+      console.error('MongoDB nbFiles Error:', error);
+      return 0;
+    }
   }
 }
 
 const dbClient = new DBClient();
-export default dbClient;
+(async () => {
+  await dbClient.connect();
+})(); // Connect on module load
+module.exports = dbClient;
