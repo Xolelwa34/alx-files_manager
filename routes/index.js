@@ -15,4 +15,8 @@ router.post('/users', UsersController.postNew);
 
 router.get('/connect', AuthController.getConnect);
 router.get('/disconnect', AuthController.getDisconnect);
-router.get('/
+
+// Add additional routes here as needed
+
+module.exports = router;
+
